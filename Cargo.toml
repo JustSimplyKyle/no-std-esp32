@@ -1,0 +1,44 @@
+[package]
+edition      = "2021"
+name         = "no-std-esp32"
+rust-version = "1.86"
+version      = "0.1.0"
+
+[[bin]]
+name = "no-std-esp32"
+path = "./src/bin/main.rs"
+
+[dependencies]
+defmt                  = "1.0.1"
+esp-bootloader-esp-idf = { version = "0.2.0", features = ["esp32"] }
+esp-hal                = { version = "=1.0.0-rc.0", features = ["defmt", "esp32", "unstable"] }
+
+# anyhow = { version = "1.0", default-features = false }
+critical-section = "1.2.0"
+esp-backtrace = { version = "0.17.0", features = [
+  "defmt",
+  "esp32",
+  "exception-handler",
+  "panic-handler",
+] }
+esp-println = { version = "0.15.0", features = ["defmt-espflash", "esp32"] }
+embedded-graphics = { version = "0.8.1", features = ["defmt"] }
+epd-waveshare = { version = "0.6.0", path = "../epd-waveshare" }
+embedded-hal = "1.0.0"
+embedded-hal-bus = "0.3.0"
+esp-alloc = "0.8.0"
+
+
+[profile.dev]
+# Rust debug is too slow.
+# For debug builds always builds with some optimization
+opt-level = "s"
+
+[profile.release]
+codegen-units    = 1     # LLVM can perform better optimizations using a single thread
+debug            = 2
+debug-assertions = false
+incremental      = false
+lto              = 'fat'
+opt-level        = 's'
+overflow-checks  = false
