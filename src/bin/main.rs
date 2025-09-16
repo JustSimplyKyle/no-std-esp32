@@ -6,17 +6,31 @@
     holding buffers for the duration of a data transfer."
 )]
 
+extern crate alloc;
+
+use alloc::rc::Rc;
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::cell::LazyCell;
 use core::convert::Infallible;
-use defmt::info;
+use core::mem::MaybeUninit;
+use defmt::{dbg, info, println};
+use embassy_executor::Spawner;
+use embedded_hal_bus::spi::ExclusiveDevice;
+use esp_hal::peripherals::Peripherals;
 use esp_hal::{
     clock::CpuClock,
     delay::Delay,
     gpio::{self, Input, InputConfig, Level, Output, OutputConfig, Pull},
     main,
+    rng::Rng,
     spi::{self, master::Spi},
     time::{Duration, Instant, Rate},
+    timer::timg::TimerGroup,
 };
-use {esp_alloc as _, esp_backtrace as _, esp_println as _};
+use esp_wifi::wifi::{self, AccessPointInfo};
+use picoserve::routing::get;
+use {esp_backtrace as _, esp_println as _};
 
 use embedded_graphics::{
     mono_font::MonoTextStyleBuilder,
@@ -24,14 +38,11 @@ use embedded_graphics::{
     primitives::{Circle, Line, PrimitiveStyle, Rectangle, StyledDrawable},
     text::{Baseline, Text, TextStyleBuilder},
 };
-use embedded_hal_bus::spi::ExclusiveDevice;
+// use embedded_hal_bus::spi::ExclusiveDevice;
+use epd_waveshare::prelude::*;
 use epd_waveshare::{
     color::ColorType,
     epd2in13b_v4::{Display2in13b, Epd2in13b},
-};
-use epd_waveshare::{
-    epd2in13b_v4::{BufferMonoDisplay2in13b, Chunk},
-    prelude::*,
 };
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
@@ -44,14 +55,72 @@ pub fn new_output<'d>(pin: impl gpio::OutputPin + 'd, initial_level: Level) -> O
     Output::new(pin, initial_level, OutputConfig::default())
 }
 
-#[main]
-fn main() -> ! {
+#[esp_hal_embassy::main]
+async fn main(_spawner: Spawner) -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let dp = esp_hal::init(config);
 
+    esp_alloc::heap_allocator!(size: 72 * 1024);
+
     info!("Starting ESP32 E-Paper Display Demo");
 
-    info!("Initializing peripherals...");
+    info!("Setting up wifi...");
+
+    let timg0 = TimerGroup::new(dp.TIMG0);
+    let init = esp_wifi::init(timg0.timer0, Rng::new(dp.RNG)).unwrap();
+
+    let (mut wifi, _) = esp_wifi::wifi::new(&init, dp.WIFI).expect("fails to create wifi");
+
+    wifi.set_configuration(&wifi::Configuration::Client(wifi::ClientConfiguration {
+        ssid: String::from("詠謙's Galaxy Note10+"),
+        password: String::from("mcvc8854"),
+        ..Default::default()
+    }))
+    .expect("fails to set wifi configuration");
+
+    wifi.start().expect("fails to start wifi");
+
+    let res: Result<Vec<AccessPointInfo>, _> = wifi.scan_n(20);
+    if let Ok(res) = res {
+        for (i, ap) in res.iter().enumerate() {
+            println!("{}: {}", i + 1, *ap.ssid);
+        }
+    }
+
+    wifi.connect()
+        .expect("fails to connect to 詠謙's Galaxy Note10+");
+
+    // Wait to get connected
+    println!("Waiting to get connected...");
+    loop {
+        let res = wifi.is_connected();
+        match res {
+            Ok(connected) => {
+                if connected {
+                    break;
+                }
+            }
+            Err(err) => {
+                println!("Fails to connect: {:?}", err);
+                loop {}
+            }
+        }
+    }
+    println!("{:?}", wifi.is_connected());
+
+    let app = Rc::new(picoserve::Router::new().route("/", get(|| async { "Hello World" })));
+
+    let config = picoserve::Config::new(picoserve::Timeouts {
+        start_read_request: Some(Duration::from_secs(5)),
+        persistent_start_read_request: Some(Duration::from_secs(1)),
+        read_request: Some(Duration::from_secs(1)),
+        write: Some(Duration::from_secs(1)),
+    })
+    .keep_connection_alive();
+
+    // let socket = TcpLis
+
+    info!("Initializing peripherals for epd...");
 
     let mut delay = Delay::new();
 
@@ -60,14 +129,12 @@ fn main() -> ! {
 
     let cs = new_output(dp.GPIO5, Level::High);
 
-    // E-paper control pins
     let busy = Input::new(dp.GPIO4, InputConfig::default().with_pull(Pull::Up));
     let rst = new_output(dp.GPIO16, Level::High);
     let dc = new_output(dp.GPIO17, Level::Low);
 
     info!("Setting up SPI...");
 
-    // Configure SPI
     let spi = Spi::new(
         dp.SPI2,
         spi::master::Config::default()
@@ -82,7 +149,6 @@ fn main() -> ! {
 
     info!("Creating e-paper display instance...");
 
-    // Initialize the e-paper display
     let mut epd = Epd2in13b::new(&mut spi_device, busy, dc, rst, &mut delay, None)
         .expect("can't setup epd2in13b instance");
 
@@ -117,55 +183,44 @@ fn main() -> ! {
     epd.clear_frame(&mut spi_device, &mut delay)
         .expect("can't update colorframe");
 
-    let black_style = PrimitiveStyle::with_stroke(Color::Black, 1);
-    let white_style = PrimitiveStyle::with_stroke(Color::White, 1);
+    let black_style = PrimitiveStyle::with_stroke(TriColor::Black, 1);
+    let red_style = PrimitiveStyle::with_stroke(TriColor::Chromatic, 1);
 
-    epd.update_achromatic_buffered(&mut spi_device, &mut delay, |buf, i| match i {
-        Chunk::Buf1 => {
-            buf.clear(Color::White)?;
-            draw_text("E-Paper ESP32", 8, 2, Color::Black, buf)?;
-            Ok(Some(()))
-        }
-        Chunk::Buf2 => {
-            buf.clear(Color::White)?;
-            Rectangle::with_corners(Point::new(2, 2), Point::new(50, 50))
-                .draw_styled(&black_style, buf)?;
-            Line::new(Point::new(2, 2), Point::new(50, 50)).draw_styled(&black_style, buf)?;
-            Line::new(Point::new(2, 50), Point::new(50, 2)).draw_styled(&black_style, buf)?;
-            Ok(Some(()))
-        }
-        Chunk::Buf3 => {
-            buf.clear(Color::White)?;
-            let rectangle = Rectangle::with_center(Point::new(25, 25), Size::new_equal(20));
-            rectangle.draw_styled(&black_style, buf)?;
-            Ok(Some(()))
-        }
-        Chunk::Buf4 => Ok(None),
-    })
-    .expect("fails to partial-update achromatic buffered");
+    let mut buffer = Display2in13b::default();
 
-    epd.update_chromatic_buffered(&mut spi_device, &mut delay, |buf, i| match i {
-        Chunk::Buf1 => {
-            buf.clear(Color::Black)?;
-            draw_text("Hello ESP32!", 8, 20, Color::White, buf)?;
-            Ok(Some(()))
-        }
-        Chunk::Buf2 => {
-            buf.clear(Color::Black)?;
-            Rectangle::with_corners(Point::new(52, 2), Point::new(100, 50))
-                .draw_styled(&PrimitiveStyle::with_fill(Color::White), buf)?;
-            Line::new(Point::new(52, 2), Point::new(100, 50)).draw_styled(&white_style, buf)?;
-            Line::new(Point::new(100, 2), Point::new(52, 50)).draw_styled(&white_style, buf)?;
-            Ok(Some(()))
-        }
-        Chunk::Buf3 => {
-            buf.clear(Color::Black)?;
-            Circle::with_center(Point::new(25, 25), 20).draw_styled(&white_style, buf)?;
-            Ok(Some(()))
-        }
-        Chunk::Buf4 => Ok(None),
-    })
-    .expect("fails to partial-update chromatic buffered");
+    || -> Result<(), Infallible> {
+        buffer.clear(TriColor::White)?;
+        let buf = &mut buffer;
+        draw_text("E-Paper ESP32", 8, 2, TriColor::Black, buf)?;
+        draw_text("Hello ESP32!", 8, 20, TriColor::Chromatic, buf)?;
+
+        Rectangle::with_corners(Point::new(2, 52), Point::new(50, 100))
+            .draw_styled(&black_style, buf)?;
+        Rectangle::with_corners(Point::new(52, 52), Point::new(100, 100))
+            .draw_styled(&PrimitiveStyle::with_fill(TriColor::Chromatic), buf)?;
+        Line::new(Point::new(52, 52), Point::new(100, 100)).draw_styled(&red_style, buf)?;
+        Line::new(Point::new(100, 52), Point::new(52, 100)).draw_styled(&red_style, buf)?;
+
+        Line::new(Point::new(2, 52), Point::new(50, 100)).draw_styled(&black_style, buf)?;
+        Line::new(Point::new(2, 100), Point::new(50, 52)).draw_styled(&black_style, buf)?;
+        Circle::with_center(Point::new(25, 125), 20).draw_styled(&red_style, buf)?;
+
+        let rectangle = Rectangle::with_center(Point::new(25, 125), Size::new_equal(20));
+        rectangle.draw_styled(&black_style, buf)?;
+
+        Ok(())
+    }()
+    .expect("drawing fails to initialize");
+
+    epd.update_color_frame(
+        &mut spi_device,
+        &mut delay,
+        buffer.bw_buffer(),
+        buffer.chromatic_buffer(),
+    )
+    .expect("updates color frame data");
+    epd.display_frame(&mut spi_device, &mut delay)
+        .expect("fails to display frame");
 
     info!("Putting display to sleep...");
     epd.sleep(&mut spi_device, &mut delay)

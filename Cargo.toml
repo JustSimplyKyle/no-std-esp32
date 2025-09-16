@@ -11,9 +11,8 @@ path = "./src/bin/main.rs"
 [dependencies]
 defmt                  = "1.0.1"
 esp-bootloader-esp-idf = { version = "0.2.0", features = ["esp32"] }
-esp-hal                = { version = "=1.0.0-rc.0", features = ["defmt", "esp32", "unstable"] }
+esp-hal                = { version = "=1.0.0-rc.0", features = ["defmt", "esp32", "unstable", "rt"] }
 
-# anyhow = { version = "1.0", default-features = false }
 critical-section = "1.2.0"
 esp-backtrace = { version = "0.17.0", features = [
   "defmt",
@@ -24,9 +23,19 @@ esp-backtrace = { version = "0.17.0", features = [
 esp-println = { version = "0.15.0", features = ["defmt-espflash", "esp32"] }
 embedded-graphics = { version = "0.8.1", features = ["defmt"] }
 epd-waveshare = { version = "0.6.0", path = "../epd-waveshare" }
-embedded-hal = "1.0.0"
 embedded-hal-bus = "0.3.0"
-esp-alloc = "0.8.0"
+xtensa-lx-rt = { version = "0.19.0", features = ["esp32"] }
+esp-wifi = { version = "0.15.0", features = ["esp32", "defmt", "wifi", "esp-now"] }
+esp-alloc        = "0.8.0"
+# embassy-executor = "0.9.1"
+esp-hal-embassy = { version = "0.8.1", features = ["esp32"] }
+embassy-executor = "0.7.0"
+picoserve = "0.16.0"
+# esp-idf-hal = "0.45.2"
+# embedded-svc = { version = "0.28.1", features = ["defmt"] }
+
+[profile.dev.package.esp-wifi]
+opt-level = 3
 
 
 [profile.dev]
