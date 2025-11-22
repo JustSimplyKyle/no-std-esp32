@@ -1,0 +1,9 @@
+[wokwi]
+version = 1
+gdbServerPort = 3333
+elf = "target/xtensa-esp32-none-elf/release/libno_std_esp32"
+firmware = "target/xtensa-esp32-none-elf/release/libno_std_esp32"
+
+[net]
+gateway="ws://localhost:9011"
+

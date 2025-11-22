@@ -1,259 +1,388 @@
 #![no_std]
+#![feature(impl_trait_in_assoc_type)]
 #![no_main]
-#![deny(
-    clippy::mem_forget,
-    reason = "mem::forget is generally not safe to do with esp_hal types, especially those \
-    holding buffers for the duration of a data transfer."
-)]
 
 extern crate alloc;
 
-use alloc::rc::Rc;
-use alloc::string::String;
-use alloc::vec::Vec;
-use core::cell::LazyCell;
-use core::convert::Infallible;
-use core::mem::MaybeUninit;
-use defmt::{dbg, info, println};
+use core::{net::Ipv4Addr, str::FromStr};
+// use defmt::warn; // defmt not always available on raw esp32 without probe-rs setup, using esp_println
+
+use defmt::{info, warn};
 use embassy_executor::Spawner;
-use embedded_hal_bus::spi::ExclusiveDevice;
-use esp_hal::peripherals::Peripherals;
+use embassy_net::{IpListenEndpoint, Ipv4Cidr, Runner, Stack, StackResources, StaticConfigV4};
+use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel};
+use embassy_time::{Duration, Timer};
+use esp_alloc::{self as _, heap_allocator};
+use esp_backtrace as _;
 use esp_hal::{
     clock::CpuClock,
-    delay::Delay,
-    gpio::{self, Input, InputConfig, Level, Output, OutputConfig, Pull},
-    main,
+    gpio::{Level, Output, OutputConfig, OutputPin},
     rng::Rng,
-    spi::{self, master::Spi},
-    time::{Duration, Instant, Rate},
     timer::timg::TimerGroup,
 };
-use esp_wifi::wifi::{self, AccessPointInfo};
-use picoserve::routing::get;
-use {esp_backtrace as _, esp_println as _};
-
-use embedded_graphics::{
-    mono_font::MonoTextStyleBuilder,
-    prelude::*,
-    primitives::{Circle, Line, PrimitiveStyle, Rectangle, StyledDrawable},
-    text::{Baseline, Text, TextStyleBuilder},
+use esp_println::println;
+use esp_wifi::{
+    init,
+    wifi::{
+        AccessPointConfiguration, Configuration, WifiController, WifiDevice, WifiEvent, WifiState,
+    },
+    EspWifiController,
 };
-// use embedded_hal_bus::spi::ExclusiveDevice;
-use epd_waveshare::prelude::*;
-use epd_waveshare::{
-    color::ColorType,
-    epd2in13b_v4::{Display2in13b, Epd2in13b},
+use picoserve::{
+    extract::Form,
+    response::{File, IntoResponse},
+    routing::{self, post},
+    AppBuilder, AppRouter,
 };
+use serde::Deserialize;
 
-// This creates a default app-descriptor required by the esp-idf bootloader.
 esp_bootloader_esp_idf::esp_app_desc!();
 
-static BLACK: [u8; 4000] = *include_bytes!("../../assets/black.gray");
-static RED: [u8; 4000] = *include_bytes!("../../assets/red.gray");
+macro_rules! mk_static {
+    ($t:ty,$val:expr) => {{
+        static STATIC_CELL: static_cell::StaticCell<$t> = static_cell::StaticCell::new();
+        #[deny(unused_attributes)]
+        let x = STATIC_CELL.uninit().write(($val));
+        x
+    }};
+}
 
-pub fn new_output<'d>(pin: impl gpio::OutputPin + 'd, initial_level: Level) -> Output<'d> {
-    Output::new(pin, initial_level, OutputConfig::default())
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "snake_case")]
+enum CommandType {
+    GoFrontPressed,
+    GoFrontReleased,
+    GoBackPressed,
+    GoBackReleased,
+    TurnLeftPressed,
+    TurnLeftReleased,
+    TurnRightPressed,
+    TurnRightReleased,
+    PullUpPressed,
+    PullUpReleased,
+    PullDownPressed,
+    PullDownReleased,
+}
+
+#[derive(Deserialize)]
+struct CommandForm {
+    command: CommandType,
+}
+
+static COMMAND_CHANNEL: Channel<CriticalSectionRawMutex, CommandType, 3> = Channel::new();
+
+async fn handle_command(Form(form): Form<CommandForm>) -> impl IntoResponse {
+    match COMMAND_CHANNEL.try_send(form.command) {
+        Ok(_) => "Command Sent",
+        Err(_) => {
+            warn!("Command Queue Full!");
+            "Busy"
+        }
+    }
+}
+
+const GW_IP_ADDR_ENV: Option<&'static str> = option_env!("GATEWAY_IP");
+
+// --- Web App Definition ---
+pub struct Application;
+
+macro_rules! static_routes {
+    ($base:literal, $($route:literal),* $(,)?) => {{
+        picoserve::Router::new()
+        $(
+            .route(
+                {
+                    concat!("/", $route)
+                },
+                routing::get_service({
+                    let content_type = if $route.ends_with(".js") {
+                        "application/javascript"
+                    } else if $route.ends_with(".css") {
+                        "text/css"
+                    } else if $route.ends_with(".wasm") {
+                        "application/wasm"
+                    } else if $route.ends_with(".html") {
+                        "text/html"
+                    } else {
+                        "application/octet-stream"
+                    };
+                    let bd = include_bytes!(concat!($base, "/", $route));
+                    File::with_content_type(content_type, bd)
+                }),
+            )
+        )*
+    }};
+}
+
+impl AppBuilder for Application {
+    type PathRouter = impl routing::PathRouter;
+
+    fn build_app(self) -> picoserve::Router<Self::PathRouter> {
+        static_routes!(
+            "/home/kyle/coding/controller-ui/target/dx/controller-ui/release/web/public",
+            "index.html",
+            "assets/tailwind-dxh996785b89232bb.css",
+            "assets/controller-ui-dxh87bbfb1e3b91454.js",
+            "assets/controller-ui_bg-dxhdd21479a9cc988ca.wasm"
+        )
+        .route("/controller", post(handle_command))
+    }
+}
+
+pub fn new_output<'d>(pin: impl OutputPin + 'd) -> Output<'d> {
+    Output::new(pin, Level::High, OutputConfig::default())
 }
 
 #[esp_hal_embassy::main]
-async fn main(_spawner: Spawner) -> ! {
+async fn main(spawner: Spawner) -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
-    let dp = esp_hal::init(config);
+    let peripherals = esp_hal::init(config);
+    esp_alloc::heap_allocator!(#[unsafe(link_section = ".dram2_uninit")] size: 98767);
+    esp_alloc::heap_allocator!(size: 48 * 1024);
+    // Initialize timers and RNG
+    let timg0 = TimerGroup::new(peripherals.TIMG0);
+    let mut rng = Rng::new(peripherals.RNG);
 
-    esp_alloc::heap_allocator!(size: 72 * 1024);
+    // Initialize Wifi Controller
+    let esp_wifi_ctrl = &*mk_static!(
+        EspWifiController<'static>,
+        init(timg0.timer0, rng.clone()).unwrap()
+    );
 
-    info!("Starting ESP32 E-Paper Display Demo");
+    let (controller, interfaces) = esp_wifi::wifi::new(&esp_wifi_ctrl, peripherals.WIFI).unwrap();
 
-    info!("Setting up wifi...");
+    // let timg0 = TimerGroup::new(peripherals.TIMG1);
+    esp_hal_embassy::init(timg0.timer1);
 
-    let timg0 = TimerGroup::new(dp.TIMG0);
-    let init = esp_wifi::init(timg0.timer0, Rng::new(dp.RNG)).unwrap();
+    let device = interfaces.ap;
 
-    let (mut wifi, _) = esp_wifi::wifi::new(&init, dp.WIFI).expect("fails to create wifi");
+    let gw_ip_addr_str = GW_IP_ADDR_ENV.unwrap_or("192.168.2.1");
+    let gw_ip_addr = Ipv4Addr::from_str(gw_ip_addr_str).expect("failed to parse gateway ip");
 
-    wifi.set_configuration(&wifi::Configuration::Client(wifi::ClientConfiguration {
-        ssid: String::from("詠謙's Galaxy Note10+"),
-        password: String::from("mcvc8854"),
-        ..Default::default()
-    }))
-    .expect("fails to set wifi configuration");
+    let config = embassy_net::Config::ipv4_static(StaticConfigV4 {
+        address: Ipv4Cidr::new(gw_ip_addr, 24),
+        gateway: Some(gw_ip_addr),
+        dns_servers: Default::default(),
+    });
 
-    wifi.start().expect("fails to start wifi");
+    let seed = (rng.random() as u64) << 32 | rng.random() as u64;
 
-    let res: Result<Vec<AccessPointInfo>, _> = wifi.scan_n(20);
-    if let Ok(res) = res {
-        for (i, ap) in res.iter().enumerate() {
-            println!("{}: {}", i + 1, *ap.ssid);
+    // Init network stack
+    // 3 sockets: 1 for HTTP, maybe 1 for DHCP (udp), 1 spare
+    let (stack, runner) = embassy_net::new(
+        device,
+        config,
+        mk_static!(StackResources<4>, StackResources::<4>::new()),
+        seed,
+    );
+
+    println!("Spawning Web Task...");
+    spawner
+        .spawn(connection(controller))
+        .expect("failed to spawn connection");
+    spawner
+        .spawn(net_task(runner))
+        .expect("failed to spawn net_task");
+
+    spawner
+        .spawn(run_dhcp(stack, gw_ip_addr_str))
+        .expect("failed to start dhcp server");
+
+    start_web_server(spawner, stack).await;
+
+    println!("Waiting for Link...");
+    loop {
+        if stack.is_link_up() {
+            break;
         }
+        Timer::after(Duration::from_millis(500)).await;
     }
 
-    wifi.connect()
-        .expect("fails to connect to 詠謙's Galaxy Note10+");
+    println!("AP Link Up! Web Server at: http://{gw_ip_addr_str}/");
 
-    // Wait to get connected
-    println!("Waiting to get connected...");
+    while !stack.is_config_up() {
+        Timer::after(Duration::from_millis(100)).await
+    }
+
+    let mut rl = new_output(peripherals.GPIO16);
+    let mut ru = new_output(peripherals.GPIO18);
+    let mut rr = new_output(peripherals.GPIO15);
+    let mut rd = new_output(peripherals.GPIO17);
+    let mut ll = new_output(peripherals.GPIO22);
+    let mut lu = new_output(peripherals.GPIO23);
+    let mut lr = new_output(peripherals.GPIO21);
+    let mut ld = new_output(peripherals.GPIO19);
+
     loop {
-        let res = wifi.is_connected();
-        match res {
-            Ok(connected) => {
-                if connected {
-                    break;
-                }
+        let command = COMMAND_CHANNEL.receive().await;
+
+        match command {
+            CommandType::GoFrontPressed => {
+                lu.set_low();
+                ru.set_low();
+                info!("Message Received: GoFrontPressed");
             }
-            Err(err) => {
-                println!("Fails to connect: {:?}", err);
-                loop {}
+            CommandType::GoFrontReleased => {
+                lu.set_high();
+                ru.set_high();
+                info!("Message Received: GoFrontReleased");
+            }
+            CommandType::GoBackPressed => {
+                ld.set_low();
+                rd.set_low();
+                info!("Message Received: GoBackPressed");
+            }
+            CommandType::GoBackReleased => {
+                ld.set_high();
+                rd.set_high();
+                info!("Message Received: GoBackReleased");
+            }
+            CommandType::TurnLeftPressed => {
+                ru.set_low();
+                info!("Message Received: TurnLeftPressed");
+            }
+            CommandType::TurnLeftReleased => {
+                ru.set_high();
+                info!("Message Received: TurnLeftReleased");
+            }
+            CommandType::TurnRightPressed => {
+                lu.set_low();
+                info!("Message Received: TurnRightPressed");
+            }
+            CommandType::TurnRightReleased => {
+                lu.set_high();
+                info!("Message Received: TurnRightReleased");
+            }
+            CommandType::PullUpPressed => {
+                rr.set_low();
+                info!("Message Received: PullUpPressed");
+            }
+            CommandType::PullUpReleased => {
+                rr.set_high();
+                info!("Message Received: PullUpReleased");
+            }
+            CommandType::PullDownPressed => {
+                rl.set_low();
+                info!("Message Received: PullDownPressed");
+            }
+            CommandType::PullDownReleased => {
+                rl.set_high();
+                info!("Message Received: PullDownReleased");
             }
         }
-    }
-    println!("{:?}", wifi.is_connected());
-
-    let app = Rc::new(picoserve::Router::new().route("/", get(|| async { "Hello World" })));
-
-    let config = picoserve::Config::new(picoserve::Timeouts {
-        start_read_request: Some(Duration::from_secs(5)),
-        persistent_start_read_request: Some(Duration::from_secs(1)),
-        read_request: Some(Duration::from_secs(1)),
-        write: Some(Duration::from_secs(1)),
-    })
-    .keep_connection_alive();
-
-    // let socket = TcpLis
-
-    info!("Initializing peripherals for epd...");
-
-    let mut delay = Delay::new();
-
-    let sclk = dp.GPIO18;
-    let mosi = dp.GPIO23; // labled "dc"
-
-    let cs = new_output(dp.GPIO5, Level::High);
-
-    let busy = Input::new(dp.GPIO4, InputConfig::default().with_pull(Pull::Up));
-    let rst = new_output(dp.GPIO16, Level::High);
-    let dc = new_output(dp.GPIO17, Level::Low);
-
-    info!("Setting up SPI...");
-
-    let spi = Spi::new(
-        dp.SPI2,
-        spi::master::Config::default()
-            .with_frequency(Rate::from_mhz(4))
-            .with_mode(spi::Mode::_0),
-    )
-    .expect("can't set up spi port")
-    .with_sck(sclk)
-    .with_mosi(mosi);
-
-    let mut spi_device = ExclusiveDevice::new(spi, cs, delay).expect("can't setup spi device");
-
-    info!("Creating e-paper display instance...");
-
-    let mut epd = Epd2in13b::new(&mut spi_device, busy, dc, rst, &mut delay, None)
-        .expect("can't setup epd2in13b instance");
-
-    epd.set_background_color(TriColor::White);
-
-    info!("Clearing display...");
-    epd.clear_frame(&mut spi_device, &mut delay)
-        .expect("can't clear frame of the epd");
-
-    info!("Loading image data...");
-
-    // Display the preloaded images
-    epd.update_color_frame_with(
-        &mut spi_device,
-        &mut delay,
-        |i| BLACK.get(i).copied().unwrap_or(0xFF),
-        |i| RED.get(i).copied().unwrap_or(0x00),
-        BLACK.len(),
-        RED.len(),
-    )
-    .expect("can't update colorframe");
-
-    info!("Displaying frame...");
-    epd.display_frame(&mut spi_device, &mut delay)
-        .expect("can't display colorframe");
-
-    info!("Waiting five seconds so you can see the image...");
-    let delay_start = Instant::now();
-    while delay_start.elapsed() < Duration::from_millis(5000) {}
-
-    info!("Drawing graphics...");
-    epd.clear_frame(&mut spi_device, &mut delay)
-        .expect("can't update colorframe");
-
-    let black_style = PrimitiveStyle::with_stroke(TriColor::Black, 1);
-    let red_style = PrimitiveStyle::with_stroke(TriColor::Chromatic, 1);
-
-    let mut buffer = Display2in13b::default();
-
-    || -> Result<(), Infallible> {
-        buffer.clear(TriColor::White)?;
-        let buf = &mut buffer;
-        draw_text("E-Paper ESP32", 8, 2, TriColor::Black, buf)?;
-        draw_text("Hello ESP32!", 8, 20, TriColor::Chromatic, buf)?;
-
-        Rectangle::with_corners(Point::new(2, 52), Point::new(50, 100))
-            .draw_styled(&black_style, buf)?;
-        Rectangle::with_corners(Point::new(52, 52), Point::new(100, 100))
-            .draw_styled(&PrimitiveStyle::with_fill(TriColor::Chromatic), buf)?;
-        Line::new(Point::new(52, 52), Point::new(100, 100)).draw_styled(&red_style, buf)?;
-        Line::new(Point::new(100, 52), Point::new(52, 100)).draw_styled(&red_style, buf)?;
-
-        Line::new(Point::new(2, 52), Point::new(50, 100)).draw_styled(&black_style, buf)?;
-        Line::new(Point::new(2, 100), Point::new(50, 52)).draw_styled(&black_style, buf)?;
-        Circle::with_center(Point::new(25, 125), 20).draw_styled(&red_style, buf)?;
-
-        let rectangle = Rectangle::with_center(Point::new(25, 125), Size::new_equal(20));
-        rectangle.draw_styled(&black_style, buf)?;
-
-        Ok(())
-    }()
-    .expect("drawing fails to initialize");
-
-    epd.update_color_frame(
-        &mut spi_device,
-        &mut delay,
-        buffer.bw_buffer(),
-        buffer.chromatic_buffer(),
-    )
-    .expect("updates color frame data");
-    epd.display_frame(&mut spi_device, &mut delay)
-        .expect("fails to display frame");
-
-    info!("Putting display to sleep...");
-    epd.sleep(&mut spi_device, &mut delay)
-        .expect("fails to put epd to sleep");
-
-    // Main loop - could add periodic updates here
-    loop {
-        let delay_start = Instant::now();
-        while delay_start.elapsed() < Duration::from_millis(1000) {}
-        info!("E-paper display is sleeping...");
     }
 }
 
-fn draw_text<
-    const WIDTH: u32,
-    const HEIGHT: u32,
-    const BWRBIT: bool,
-    const BYTECOUNT: usize,
-    COLOR: ColorType + PixelColor,
->(
-    text: &str,
-    x: i32,
-    y: i32,
-    color: COLOR,
-    display: &mut Display<WIDTH, HEIGHT, BWRBIT, BYTECOUNT, COLOR>,
-) -> Result<(), Infallible> {
-    let style = MonoTextStyleBuilder::new()
-        .font(&embedded_graphics::mono_font::ascii::FONT_9X15)
-        .text_color(color)
-        .build();
+#[embassy_executor::task]
+async fn run_dhcp(stack: Stack<'static>, gw_ip_addr: &'static str) {
+    use core::net::{Ipv4Addr, SocketAddrV4};
 
-    let text_style = TextStyleBuilder::new().baseline(Baseline::Top).build();
+    use edge_dhcp::{
+        io::{self, DEFAULT_SERVER_PORT},
+        server::{Server, ServerOptions},
+    };
+    use edge_nal::UdpBind;
+    use edge_nal_embassy::{Udp, UdpBuffers};
 
-    Text::with_text_style(text, Point::new(x, y), style, text_style).draw(display)?;
-    Ok(())
+    let ip = Ipv4Addr::from_str(gw_ip_addr).expect("dhcp task failed to parse gw ip");
+
+    let mut buf = [0u8; 1500];
+
+    let mut gw_buf = [Ipv4Addr::UNSPECIFIED];
+
+    let buffers = mk_static!(
+        UdpBuffers::<3, 1024, 1024, 10>,
+        UdpBuffers::<3, 1024, 1024, 10>::new()
+    );
+
+    let unbound_socket = Udp::new(stack, buffers);
+    let mut bound_socket = unbound_socket
+        .bind(core::net::SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::UNSPECIFIED,
+            DEFAULT_SERVER_PORT,
+        )))
+        .await
+        .unwrap();
+
+    loop {
+        _ = io::server::run(
+            &mut Server::<_, 64>::new_with_et(ip),
+            &ServerOptions::new(ip, Some(&mut gw_buf)),
+            &mut bound_socket,
+            &mut buf,
+        )
+        .await
+        .inspect_err(|_e| warn!("DHCP server error")); // fixed unused variable warning
+        Timer::after(Duration::from_millis(500)).await;
+    }
+}
+
+const WEB_POOL_SIZE: usize = 2;
+
+#[embassy_executor::task(pool_size = WEB_POOL_SIZE)]
+async fn web_task(
+    id: usize,
+    stack: Stack<'static>,
+    app: &'static AppRouter<Application>,
+    config: &'static picoserve::Config<Duration>,
+) {
+    let mut tcp_rx = [0u8; 1024];
+    let mut tcp_tx = [0u8; 1024];
+    let mut http_buf = [0u8; 2048];
+    let port = 8080;
+
+    println!("Web server listening on port {}", port);
+
+    picoserve::Server::new(&app, &config, &mut http_buf)
+        .listen_and_serve(id, stack, port, &mut tcp_rx, &mut tcp_tx)
+        .await;
+}
+
+pub async fn start_web_server(spawner: Spawner, stack: embassy_net::Stack<'static>) {
+    println!("Starting web server with {WEB_POOL_SIZE} tasks...");
+
+    let app = mk_static!(AppRouter<Application>, Application.build_app());
+
+    let config = mk_static!(
+        picoserve::Config::<Duration>,
+        picoserve::Config::new(picoserve::Timeouts {
+            start_read_request: Some(Duration::from_secs(5)),
+            persistent_start_read_request: Some(Duration::from_secs(1)),
+            read_request: Some(Duration::from_secs(1)),
+            write: Some(Duration::from_secs(1)),
+        })
+        .keep_connection_alive()
+    );
+
+    for id in 0..WEB_POOL_SIZE {
+        spawner.must_spawn(web_task(id, stack, app, config));
+    }
+}
+
+#[embassy_executor::task]
+async fn connection(mut controller: WifiController<'static>) {
+    println!("start connection task");
+    loop {
+        if let WifiState::ApStarted = esp_wifi::wifi::wifi_state() {
+            // We are up, wait until stopped
+            controller.wait_for_event(WifiEvent::ApStop).await;
+            Timer::after(Duration::from_millis(5000)).await
+        }
+
+        if !matches!(controller.is_started(), Ok(true)) {
+            let client_config = Configuration::AccessPoint(AccessPointConfiguration {
+                ssid: "esp-wifi".try_into().unwrap(),
+                ..Default::default()
+            });
+            controller.set_configuration(&client_config).unwrap();
+            println!("Starting wifi...");
+            controller.start_async().await.unwrap();
+            println!("Wifi started!");
+        }
+    }
+}
+
+#[embassy_executor::task]
+async fn net_task(mut runner: Runner<'static, WifiDevice<'static>>) {
+    runner.run().await
 }
