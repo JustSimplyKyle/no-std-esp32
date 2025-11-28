@@ -1298,6 +1298,7 @@ dependencies = [
  "edge-nal",
  "edge-nal-embassy",
  "embassy-executor",
+ "embassy-futures",
  "embassy-net",
  "embassy-sync 0.7.2",
  "embassy-time",

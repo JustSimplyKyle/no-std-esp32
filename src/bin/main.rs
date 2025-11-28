@@ -9,10 +9,11 @@ use core::{net::Ipv4Addr, str::FromStr};
 
 use defmt::{info, warn};
 use embassy_executor::Spawner;
-use embassy_net::{IpListenEndpoint, Ipv4Cidr, Runner, Stack, StackResources, StaticConfigV4};
+use embassy_futures::select::{self, Either};
+use embassy_net::{Ipv4Cidr, Runner, Stack, StackResources, StaticConfigV4};
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel};
-use embassy_time::{Duration, Timer};
-use esp_alloc::{self as _, heap_allocator};
+use embassy_time::{Duration, Instant, Timer};
+use esp_alloc::{self as _};
 use esp_backtrace as _;
 use esp_hal::{
     clock::CpuClock,
@@ -49,30 +50,31 @@ macro_rules! mk_static {
 
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "snake_case")]
+#[serde(tag = "cmd", content = "status")]
 enum CommandType {
-    GoFrontPressed,
-    GoFrontReleased,
-    GoBackPressed,
-    GoBackReleased,
-    TurnLeftPressed,
-    TurnLeftReleased,
-    TurnRightPressed,
-    TurnRightReleased,
-    PullUpPressed,
-    PullUpReleased,
-    PullDownPressed,
-    PullDownReleased,
+    GoFront(Status),
+    GoBack(Status),
+    TurnLeft(Status),
+    TurnRight(Status),
+    PullUp(Status),
+    PullDown(Status),
+    ArmUp(Status),
+    ArmDown(Status),
+    BlinkRate(u64),
 }
 
-#[derive(Deserialize)]
-struct CommandForm {
-    command: CommandType,
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "snake_case")]
+enum Status {
+    Pressed,
+    Released,
+    BlinkOnce,
 }
 
 static COMMAND_CHANNEL: Channel<CriticalSectionRawMutex, CommandType, 3> = Channel::new();
 
-async fn handle_command(Form(form): Form<CommandForm>) -> impl IntoResponse {
-    match COMMAND_CHANNEL.try_send(form.command) {
+async fn handle_command(Form(form): Form<CommandType>) -> impl IntoResponse {
+    match COMMAND_CHANNEL.try_send(form) {
         Ok(_) => "Command Sent",
         Err(_) => {
             warn!("Command Queue Full!");
@@ -87,12 +89,18 @@ const GW_IP_ADDR_ENV: Option<&'static str> = option_env!("GATEWAY_IP");
 pub struct Application;
 
 macro_rules! static_routes {
-    ($base:literal, $($route:literal),* $(,)?) => {{
+    ($base:literal, $(
+        $route:literal
+    ),* $(,)?) => {{
         picoserve::Router::new()
         $(
             .route(
                 {
-                    concat!("/", $route)
+                    if $route == "index.html" {
+                        "/"
+                    } else {
+                        concat!("/", $route)
+                    }
                 },
                 routing::get_service({
                     let content_type = if $route.ends_with(".js") {
@@ -114,22 +122,9 @@ macro_rules! static_routes {
     }};
 }
 
-impl AppBuilder for Application {
-    type PathRouter = impl routing::PathRouter;
+include!("../../include.rs");
 
-    fn build_app(self) -> picoserve::Router<Self::PathRouter> {
-        static_routes!(
-            "/home/kyle/coding/controller-ui/target/dx/controller-ui/release/web/public",
-            "index.html",
-            "assets/tailwind-dxh996785b89232bb.css",
-            "assets/controller-ui-dxh87bbfb1e3b91454.js",
-            "assets/controller-ui_bg-dxhdd21479a9cc988ca.wasm"
-        )
-        .route("/controller", post(handle_command))
-    }
-}
-
-pub fn new_output<'d>(pin: impl OutputPin + 'd) -> Output<'d> {
+pub fn new_controller_output<'d>(pin: impl OutputPin + 'd) -> Output<'d> {
     Output::new(pin, Level::High, OutputConfig::default())
 }
 
@@ -172,7 +167,7 @@ async fn main(spawner: Spawner) -> ! {
     let (stack, runner) = embassy_net::new(
         device,
         config,
-        mk_static!(StackResources<4>, StackResources::<4>::new()),
+        mk_static!(StackResources<5>, StackResources::<5>::new()),
         seed,
     );
 
@@ -204,70 +199,163 @@ async fn main(spawner: Spawner) -> ! {
         Timer::after(Duration::from_millis(100)).await
     }
 
-    let mut rl = new_output(peripherals.GPIO16);
-    let mut ru = new_output(peripherals.GPIO18);
-    let mut rr = new_output(peripherals.GPIO15);
-    let mut rd = new_output(peripherals.GPIO17);
-    let mut ll = new_output(peripherals.GPIO22);
-    let mut lu = new_output(peripherals.GPIO23);
-    let mut lr = new_output(peripherals.GPIO21);
-    let mut ld = new_output(peripherals.GPIO19);
+    let mut rl = new_controller_output(peripherals.GPIO16);
+    let mut ru = new_controller_output(peripherals.GPIO18);
+    let mut rr = new_controller_output(peripherals.GPIO5);
+    let mut rd = new_controller_output(peripherals.GPIO17);
+    let mut ll = new_controller_output(peripherals.GPIO22);
+    let mut lu = new_controller_output(peripherals.GPIO23);
+    let mut lr = new_controller_output(peripherals.GPIO21);
+    let mut ld = new_controller_output(peripherals.GPIO19);
+    let mut blink_rate = 100;
+    let mut blink_expiry: Option<(Instant, (&mut Output, Option<&mut Output>))> = None;
 
     loop {
-        let command = COMMAND_CHANNEL.receive().await;
+        // We decide how to wait for the command based on whether we are blinking or not
+        let command = if let Some((expiry, pins)) = blink_expiry {
+            // We are currently blinking. Wait for EITHER a new command OR the timer.
+            match select::select(COMMAND_CHANNEL.receive(), Timer::at(expiry)).await {
+                Either::First(cmd) => {
+                    // We got a command! Return it to be processed below.
+                    cmd
+                }
+                Either::Second(_) => {
+                    pins.0.set_high();
+                    if let Some(pin) = pins.1 {
+                        pin.set_high();
+                    }
+                    blink_expiry = None;
+                    // Restart the loop to wait for a command normally
+                    continue;
+                }
+            }
+        } else {
+            COMMAND_CHANNEL.receive().await
+        };
+
+        // If we receive any manual movement command, we should probably cancel the blink timer
+        // so the timer doesn't accidentally turn off the motors later.
+        blink_expiry = None;
+        let mut blink =
+            |pins| blink_expiry = Some((Instant::now() + Duration::from_millis(blink_rate), pins));
 
         match command {
-            CommandType::GoFrontPressed => {
+            CommandType::GoFront(Status::Pressed) => {
                 lu.set_low();
                 ru.set_low();
                 info!("Message Received: GoFrontPressed");
             }
-            CommandType::GoFrontReleased => {
+            CommandType::GoFront(Status::Released) => {
                 lu.set_high();
                 ru.set_high();
                 info!("Message Received: GoFrontReleased");
             }
-            CommandType::GoBackPressed => {
+            CommandType::GoFront(Status::BlinkOnce) => {
+                lu.set_low();
+                ru.set_low();
+                info!("Message Received: GoFrontBlink");
+                blink((&mut lu, Some(&mut ru)));
+            }
+            CommandType::GoBack(Status::Pressed) => {
                 ld.set_low();
                 rd.set_low();
                 info!("Message Received: GoBackPressed");
             }
-            CommandType::GoBackReleased => {
+            CommandType::GoBack(Status::Released) => {
                 ld.set_high();
                 rd.set_high();
                 info!("Message Received: GoBackReleased");
             }
-            CommandType::TurnLeftPressed => {
-                ru.set_low();
+            CommandType::GoBack(Status::BlinkOnce) => {
+                ld.set_low();
+                rd.set_low();
+                info!("Message Received: GoBackBlinkOnce");
+                blink((&mut ld, Some(&mut rd)));
+            }
+            CommandType::TurnLeft(Status::Pressed) => {
+                lu.set_low();
                 info!("Message Received: TurnLeftPressed");
             }
-            CommandType::TurnLeftReleased => {
-                ru.set_high();
+            CommandType::TurnLeft(Status::Released) => {
+                lu.set_high();
                 info!("Message Received: TurnLeftReleased");
             }
-            CommandType::TurnRightPressed => {
+            CommandType::TurnLeft(Status::BlinkOnce) => {
                 lu.set_low();
+                blink((&mut lu, None));
+                info!("Message Received: TurnLeftBlinkOnce");
+            }
+            CommandType::TurnRight(Status::Pressed) => {
+                ru.set_low();
                 info!("Message Received: TurnRightPressed");
             }
-            CommandType::TurnRightReleased => {
-                lu.set_high();
+            CommandType::TurnRight(Status::Released) => {
+                ru.set_high();
                 info!("Message Received: TurnRightReleased");
             }
-            CommandType::PullUpPressed => {
+            CommandType::TurnRight(Status::BlinkOnce) => {
+                ru.set_low();
+                info!("Message Received: TurnRightBlinkOnce");
+                blink((&mut ru, None));
+            }
+            CommandType::PullUp(Status::Pressed) => {
                 rr.set_low();
                 info!("Message Received: PullUpPressed");
             }
-            CommandType::PullUpReleased => {
+            CommandType::PullUp(Status::Released) => {
                 rr.set_high();
                 info!("Message Received: PullUpReleased");
             }
-            CommandType::PullDownPressed => {
+            CommandType::PullUp(Status::BlinkOnce) => {
+                rr.set_low();
+                info!("Message Received: PullUpBlinkOnce");
+                blink((&mut rr, None));
+            }
+            CommandType::PullDown(Status::Pressed) => {
                 rl.set_low();
                 info!("Message Received: PullDownPressed");
             }
-            CommandType::PullDownReleased => {
+            CommandType::PullDown(Status::Released) => {
                 rl.set_high();
                 info!("Message Received: PullDownReleased");
+            }
+            CommandType::PullDown(Status::BlinkOnce) => {
+                rl.set_low();
+                info!("Message Received: PullDownBlinkOnce");
+                blink((&mut rl, None));
+            }
+            CommandType::ArmUp(Status::Pressed) => {
+                ll.set_low();
+                info!("Message Received: ArmUpPressed");
+            }
+            CommandType::ArmUp(Status::Released) => {
+                ll.set_high();
+                info!("Message Received: ArmUpReleased");
+            }
+            CommandType::ArmUp(Status::BlinkOnce) => {
+                ll.set_low();
+                info!("Message Received: ArmUpBlinkOnce");
+                blink((&mut ll, None));
+            }
+            CommandType::ArmDown(Status::Pressed) => {
+                lr.set_low();
+                info!("Message Received: ArmDownPressed");
+            }
+            CommandType::ArmDown(Status::Released) => {
+                lr.set_high();
+                info!("Message Received: ArmDownReleased");
+            }
+            CommandType::ArmDown(Status::BlinkOnce) => {
+                lr.set_low();
+                info!("Message Received: ArmDownBlinkOnce");
+                blink((&mut lr, None));
+            }
+            CommandType::BlinkRate(x) => {
+                blink_rate = x;
+                info!(
+                    "Message Received: BlinkRate changed from {} to {}",
+                    blink_rate, x
+                );
             }
         }
     }
@@ -317,7 +405,7 @@ async fn run_dhcp(stack: Stack<'static>, gw_ip_addr: &'static str) {
     }
 }
 
-const WEB_POOL_SIZE: usize = 2;
+const WEB_POOL_SIZE: usize = 3;
 
 #[embassy_executor::task(pool_size = WEB_POOL_SIZE)]
 async fn web_task(
@@ -329,7 +417,7 @@ async fn web_task(
     let mut tcp_rx = [0u8; 1024];
     let mut tcp_tx = [0u8; 1024];
     let mut http_buf = [0u8; 2048];
-    let port = 8080;
+    let port = 80;
 
     println!("Web server listening on port {}", port);
 
