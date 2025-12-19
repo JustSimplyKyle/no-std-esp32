@@ -1,4 +1,23 @@
 fn main() {
+    // 1. Define the path to your script
+    // let script_path = "/home/kyle/coding/controller-ui/out.sh";
+
+    // // 2. Execute the shell script
+    // let status = std::process::Command::new(script_path)
+    //     .status()
+    //     .expect("Failed to execute out.sh");
+
+    // // 3. Panic if the script fails (stops the build)
+    // if !status.success() {
+    //     panic!("out.sh failed with exit code: {:?}", status.code());
+    // }
+
+    // // 4. TRIGGER CONFIGURATION:
+
+    // // OPTION A: Run ONLY if the script or the UI folder changes (Recommended)
+    // // This tells Cargo: "If anything in the controller-ui folder changes, run this build script again."
+    // println!("cargo:rerun-if-changed=/home/kyle/coding/controller-ui/src/main.rs");
+
     linker_be_nice();
     println!("cargo:rustc-link-arg=-Tdefmt.x");
     // make sure linkall.x is the last linker script (otherwise might cause problems with flip-link)
