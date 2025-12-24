@@ -1,5 +1,6 @@
 use core::str::FromStr;
 use edge_nal_embassy::UdpBuffers;
+use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel};
 use picoserve::{
     extract::Form,
     response::{File, IntoResponse},
@@ -30,8 +31,40 @@ use embassy_time::Timer;
 
 use embassy_net::Stack;
 use picoserve::AppRouter;
+use serde::Deserialize;
 
-use crate::{mk_static, CommandType, COMMAND_CHANNEL};
+use crate::mk_static;
+
+pub static COMMAND_CHANNEL: Channel<CriticalSectionRawMutex, CommandType, { WEB_POOL_SIZE * 2 }> =
+    Channel::new();
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "snake_case")]
+#[serde(tag = "cmd", content = "status")]
+pub enum CommandType {
+    GoFront(Status),
+    GoBack(Status),
+    TurnLeft(Status),
+    TurnRight(Status),
+    TurnFront(Status),
+    PullUp(Status),
+    PullDown(Status),
+    ArmUp(Status),
+    ArmDown(Status),
+    BlinkRate(u64),
+    FrequencyKilohertz(u32),
+    PwmPercentage(u8),
+    ServoDelay(u64),
+    Heartbeat,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum Status {
+    Pressed,
+    Released,
+    BlinkOnce,
+}
 
 pub struct Application;
 

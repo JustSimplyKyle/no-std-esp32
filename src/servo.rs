@@ -1,4 +1,5 @@
 use defmt::info;
+use embassy_sync::blocking_mutex::CriticalSectionMutex;
 use embassy_sync::once_lock::OnceLock;
 use embassy_time::Duration;
 use embedded_hal::pwm::SetDutyCycle;
@@ -8,7 +9,7 @@ use esp_hal::ledc::channel::Channel;
 
 use core::sync::atomic::Ordering;
 
-use esp_hal::ledc::HighSpeed;
+use esp_hal::ledc::{timer, HighSpeed, LowSpeed};
 
 use core::sync::atomic::AtomicU32;
 
@@ -22,16 +23,25 @@ pub static MAX_DUTY_CYCLE: OnceLock<u32> = OnceLock::new();
 
 pub static INITIAL_ANGLE: AtomicU32 = AtomicU32::new(45);
 
+pub static DELAY_SIGNAL: Signal<CriticalSectionRawMutex, Duration> = Signal::new();
+
 #[embassy_executor::task]
 pub async fn servo_task(mut channel: Channel<'static, HighSpeed>) {
     // Set initial position
     let _ = channel.set_duty_cycle(duty_from_angle(45).await);
+
+    let mut delay = Duration::from_millis(1);
 
     loop {
         // Wait here until the Main Task signals a new angle.
         // The executor puts this task to sleep (no CPU usage) until signaled.
         let target_angle = SERVO_SIGNAL.wait().await;
         let current_angle = INITIAL_ANGLE.load(Ordering::Relaxed);
+
+        if DELAY_SIGNAL.signaled() {
+            delay = DELAY_SIGNAL.wait().await;
+            info!("Delay for servo has changed to {}µs", delay.as_micros());
+        }
 
         if target_angle == current_angle {
             continue;
@@ -45,7 +55,7 @@ pub async fn servo_task(mut channel: Channel<'static, HighSpeed>) {
         let mut turn_to = async |i| {
             let duty = duty_from_angle(i).await;
             let _ = channel.set_duty_cycle(duty);
-            Timer::after(Duration::from_millis(5)).await;
+            Timer::after(delay).await;
             INITIAL_ANGLE.store(i, Ordering::Relaxed);
         };
 

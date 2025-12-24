@@ -11,9 +11,11 @@ use no_std_esp32::{
     mk_static,
     ps2::*,
     ps2_controller_task,
-    servo::{servo_task, MAX_DUTY_CYCLE, SERVO_SIGNAL},
-    web_tasks::{self, connection, link_monitor_task, net_task, run_dhcp, WEB_POOL_SIZE},
-    CommandType, Status, COMMAND_CHANNEL,
+    servo::{self, servo_task, DELAY_SIGNAL, MAX_DUTY_CYCLE},
+    web::{
+        self, connection, link_monitor_task, net_task, run_dhcp, CommandType, Status,
+        COMMAND_CHANNEL, WEB_POOL_SIZE,
+    },
 };
 
 use defmt::{error, info};
@@ -28,6 +30,7 @@ use esp_hal::{
     delay::Delay,
     gpio::{Input, InputConfig, Level, Output, OutputConfig, OutputPin, Pull},
     ledc::{
+        self,
         channel::{self, ChannelIFace},
         timer::{self, LSClockSource, TimerIFace},
         HighSpeed, LSGlobalClkSource, Ledc, LowSpeed,
@@ -53,22 +56,6 @@ pub fn new_controller_output<'d>(
     )
 }
 
-pub fn set_frequency<'d>(timer: &mut timer::Timer<'d, LowSpeed>, frequency: Rate) {
-    let duty = if frequency > Rate::from_khz(8) {
-        timer::config::Duty::Duty5Bit
-    } else {
-        timer::config::Duty::Duty8Bit
-    };
-
-    timer
-        .configure(timer::config::Config {
-            duty,
-            clock_source: LSClockSource::APBClk,
-            frequency,
-        })
-        .unwrap();
-}
-
 macro_rules! blink_vec {
     // Main entry point: matches comma-separated list of items
     ( $( $pin:ident $(: $state:expr)? ),* $(,)? ) => {
@@ -89,6 +76,52 @@ macro_rules! blink_vec {
     (@value) => { false };
 }
 
+struct StepMotor<'a> {
+    channel: ledc::channel::Channel<'a, LowSpeed>,
+    timer: timer::Timer<'a, LowSpeed>,
+}
+
+impl<'a> StepMotor<'a> {
+    fn set_frequency(&mut self, frequency: Rate) {
+        let duty = if frequency > Rate::from_khz(12) {
+            timer::config::Duty::Duty5Bit
+        } else {
+            timer::config::Duty::Duty8Bit
+        };
+        self.timer
+            .configure(timer::config::Config {
+                duty,
+                clock_source: LSClockSource::APBClk,
+                frequency,
+            })
+            .unwrap(); // SAFETY: plz find a way to remove this.
+        let timer: &'a timer::Timer<'a, LowSpeed> =
+            unsafe { core::mem::transmute(&self.timer as &timer::Timer<'a, LowSpeed>) };
+        self.channel
+            .configure(channel::config::Config {
+                timer,
+                duty_pct: 100,
+                pin_config: channel::config::PinConfig::PushPull,
+            })
+            .unwrap();
+    }
+    fn set_duty(&mut self, duty_percentage: u8) -> Result<(), channel::Error> {
+        self.channel.set_duty(duty_percentage)
+    }
+    fn new(
+        ledc: &Ledc<'a>,
+        timer: timer::Number,
+        channel: channel::Number,
+        pin: impl OutputPin + 'a,
+        initial_rate: Rate,
+    ) -> Self {
+        let timer = ledc.timer(timer);
+        let channel = ledc.channel(channel, pin);
+        let mut tmp = Self { timer, channel };
+        tmp.set_frequency(initial_rate);
+        tmp
+    }
+}
 #[esp_hal_embassy::main]
 async fn main(spawner: Spawner) -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
@@ -113,7 +146,7 @@ async fn main(spawner: Spawner) -> ! {
     let device = interfaces.ap;
 
     let gw_ip_addr_str = "192.168.2.1";
-    let gw_ip_addr = Ipv4Addr::from_str("192.168.2.1").expect("failed to parse gateway ip");
+    let gw_ip_addr = Ipv4Addr::from_str(gw_ip_addr_str).expect("failed to parse gateway ip");
 
     let config = embassy_net::Config::ipv4_static(StaticConfigV4 {
         address: Ipv4Cidr::new(gw_ip_addr, 24),
@@ -151,7 +184,7 @@ async fn main(spawner: Spawner) -> ! {
         .spawn(link_monitor_task(stack, gw_ip_addr_str))
         .expect("failed to spawn monitor");
 
-    web_tasks::start_web_server(spawner, stack).await;
+    web::start_web_server(spawner, stack).await;
 
     let mut rl = new_controller_output(peripherals.GPIO16, None);
     let mut ru = new_controller_output(peripherals.GPIO18, None);
@@ -163,18 +196,26 @@ async fn main(spawner: Spawner) -> ! {
     let mut ld = new_controller_output(peripherals.GPIO19, None);
     let mut in1 = new_controller_output(peripherals.GPIO26, Level::Low);
     let mut in2 = new_controller_output(peripherals.GPIO25, Level::Low);
-    let motor1_pwm = peripherals.GPIO27;
-    let motor2_pwm = peripherals.GPIO4;
     let servo_pwm = peripherals.GPIO2;
 
-    let mut ledc = Ledc::new(peripherals.LEDC);
+    let ledc = mk_static!(Ledc<'static>, Ledc::new(peripherals.LEDC));
     ledc.set_global_slow_clock(LSGlobalClkSource::APBClk);
 
-    // <forward wheels>
-    let mut lstimer0 = ledc.timer::<LowSpeed>(timer::Number::Timer0);
-    let channel0 = ledc.channel::<LowSpeed>(channel::Number::Channel0, motor1_pwm);
-    let mut lstimer1 = ledc.timer::<LowSpeed>(timer::Number::Timer1);
-    let channel1 = ledc.channel::<LowSpeed>(channel::Number::Channel1, motor2_pwm);
+    let mut motor1 = StepMotor::new(
+        ledc,
+        timer::Number::Timer0,
+        channel::Number::Channel0,
+        peripherals.GPIO27,
+        Rate::from_khz(8),
+    );
+
+    let mut motor2 = StepMotor::new(
+        ledc,
+        timer::Number::Timer1,
+        channel::Number::Channel1,
+        peripherals.GPIO4,
+        Rate::from_khz(8),
+    );
 
     // <turning wheels>
     let hstimer2 = mk_static!(
@@ -206,9 +247,6 @@ async fn main(spawner: Spawner) -> ! {
     spawner
         .spawn(servo_task(channel2))
         .expect("Failed to spawn servo task");
-
-    set_frequency(&mut lstimer0, Rate::from_khz(8));
-    set_frequency(&mut lstimer1, Rate::from_khz(8));
 
     let mut in3 = new_controller_output(peripherals.GPIO33, Level::Low);
     let mut in4 = new_controller_output(peripherals.GPIO32, Level::Low);
@@ -278,6 +316,7 @@ async fn main(spawner: Spawner) -> ! {
             |pins| blink_expiry = Some((Instant::now() + Duration::from_millis(blink_rate), pins));
 
         match command {
+            CommandType::Heartbeat => {}
             // front wheel and back wheel go front
             CommandType::GoFront(Status::Pressed) => {
                 rd.set_low();
@@ -337,7 +376,7 @@ async fn main(spawner: Spawner) -> ! {
             }
             CommandType::TurnLeft(Status::Pressed) => {
                 rd.set_low();
-                SERVO_SIGNAL.signal(75);
+                servo::SERVO_SIGNAL.signal(85);
                 info!("Message Received: TurnLeftPressed");
             }
             CommandType::TurnLeft(Status::Released) => {
@@ -350,7 +389,7 @@ async fn main(spawner: Spawner) -> ! {
                 info!("Message Received: TurnLeftBlinkOnce");
             }
             CommandType::TurnFront(Status::Pressed) => {
-                SERVO_SIGNAL.signal(45);
+                servo::SERVO_SIGNAL.signal(45);
                 info!("Message Received: TurnFrontPressed");
             }
             CommandType::TurnFront(_) => {
@@ -358,7 +397,7 @@ async fn main(spawner: Spawner) -> ! {
             }
             CommandType::TurnRight(Status::Pressed) => {
                 lr.set_low();
-                SERVO_SIGNAL.signal(15);
+                servo::SERVO_SIGNAL.signal(5);
                 info!("Message Received: TurnRightPressed");
             }
             CommandType::TurnRight(Status::Released) => {
@@ -434,20 +473,25 @@ async fn main(spawner: Spawner) -> ! {
                     "Message Received: Pwm Percentage duty cycle changed from {} to {}",
                     duty_percentage, percentage
                 );
-                channel0
+                motor1
                     .set_duty(percentage)
-                    .expect("failed to set channel0 duty cycle");
-                channel1
+                    .expect("failed to set motor1 duty cycle");
+                motor2
                     .set_duty(percentage)
-                    .expect("failed to set channel1 duty cycle");
+                    .expect("failed to set motor2 duty cycle");
                 duty_percentage = percentage;
             }
             CommandType::FrequencyKilohertz(rate) => {
-                set_frequency(&mut lstimer0, Rate::from_hz(rate));
-                set_frequency(&mut lstimer1, Rate::from_hz(rate));
-                channel0.set_duty(duty_percentage).unwrap();
-                channel1.set_duty(duty_percentage).unwrap();
+                motor1.set_frequency(Rate::from_hz(rate));
+                motor2.set_frequency(Rate::from_hz(rate));
+                motor1.set_duty(duty_percentage).unwrap();
+                motor2.set_duty(duty_percentage).unwrap();
                 info!("Message Received: Frequeency changed to {}", rate);
+            }
+            CommandType::ServoDelay(microsecond) => {
+                let delay = Duration::from_micros(microsecond);
+                DELAY_SIGNAL.signal(delay);
+                info!("Message Received: Servo delay changed to {}µs", microsecond);
             }
         }
     }

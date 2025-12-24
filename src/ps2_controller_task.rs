@@ -2,9 +2,9 @@ use defmt::warn;
 use embassy_time::Duration;
 
 use crate::ps2::Ps2Controller;
-use crate::CommandType;
-use crate::Status;
-use crate::COMMAND_CHANNEL;
+use crate::web::CommandType;
+use crate::web::Status;
+use crate::web::COMMAND_CHANNEL;
 
 use embassy_time::Timer;
 
