@@ -23,7 +23,7 @@ use embassy_executor::Spawner;
 use embassy_futures::select::{self, Either};
 use embassy_net::{Ipv4Cidr, StackResources, StaticConfigV4};
 use embassy_time::{Duration, Instant, Timer};
-use esp_alloc::{self as _};
+use esp_alloc::{self as _, HEAP};
 use esp_backtrace as _;
 use esp_hal::{
     clock::CpuClock,
@@ -289,7 +289,15 @@ async fn main(spawner: Spawner) -> ! {
         let command = if let Some((expiry, pins)) = blink_expiry {
             match select::select(COMMAND_CHANNEL.receive(), Timer::at(expiry)).await {
                 Either::First(cmd) => {
-                    // We got a command! Return it to be processed below.
+                    // We are interrupting the timer, so we must manually clean up
+                    // the previous state (turn off the pins) before processing the new command.
+                    for (ele, activeness) in pins {
+                        if activeness {
+                            ele.set_low();
+                        } else {
+                            ele.set_high();
+                        }
+                    }
                     cmd
                 }
                 Either::Second(_) => {
@@ -309,8 +317,6 @@ async fn main(spawner: Spawner) -> ! {
             COMMAND_CHANNEL.receive().await
         };
 
-        // If we receive any manual movement command, we should probably cancel the blink timer
-        // so the timer doesn't accidentally turn off the motors later.
         blink_expiry = None;
         let mut blink =
             |pins| blink_expiry = Some((Instant::now() + Duration::from_millis(blink_rate), pins));

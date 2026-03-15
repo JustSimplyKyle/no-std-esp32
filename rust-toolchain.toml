@@ -1,2 +1,2 @@
 [toolchain]
-channel = "esp"
+channel = "xtensa-esp32-none-elf"

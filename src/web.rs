@@ -115,7 +115,13 @@ async fn handle_command(Form(form): Form<CommandType>) -> impl IntoResponse {
     }
 }
 
-include!("../include.rs");
+use include_folder_macro::bundle_dioxus_app;
+
+// ... imports ...
+
+// This single line triggers the build, parses JSON, and generates the impl
+bundle_dioxus_app!("../controller-ui");
+// include!("../include.rs");
 
 #[embassy_executor::task]
 pub async fn link_monitor_task(stack: Stack<'static>, gw_ip: &'static str) {
